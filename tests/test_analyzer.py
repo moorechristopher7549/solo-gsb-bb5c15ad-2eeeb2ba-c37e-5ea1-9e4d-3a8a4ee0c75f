@@ -2,11 +2,14 @@
 import random
 
 import pytest
-from ipaddress import IPv4Network, collapse_addresses, ip_network
+from ipaddress import IPv4Address, IPv4Network, collapse_addresses, ip_network
 
 from app.analyzer import (
     InvalidCIDRError,
+    V4_SPACE,
     analyze_rules,
+    build_decision_intervals,
+    compare_rule_sets,
     compress_intervals,
     merge_intervals,
     parse_cidr_v4,
@@ -213,3 +216,190 @@ def test_random_rules_oracle():
             sum(r["effective_addresses"] for r in result["rules"])
             == len(seen_effective)
         )
+
+
+# ---------- 规则集等价性比较 ----------
+
+def test_decision_partition_covers_full_space_without_enumeration():
+    rules = [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")]
+    partition = build_decision_intervals(rules, "deny")
+
+    # 有序、首尾相接、数量守恒：完整覆盖整个 IPv4 空间
+    assert partition[0][0] == 0
+    assert partition[-1][1] == V4_SPACE - 1
+    assert sum(end - start + 1 for start, end, _ in partition) == V4_SPACE
+    for (_, prev_end, _), (next_start, _, _) in zip(partition, partition[1:]):
+        assert next_start == prev_end + 1
+
+    # 10.1/16 先命中 allow；其余 10/8 为 allow；外部为默认 deny
+    actions = {action for _, _, action in partition}
+    assert actions == {"allow", "deny"}
+    assert build_decision_intervals(rules, "deny")[0][2] == "deny"
+
+    # 被完全遮蔽的规则不出现在最终判定中
+    shadowed = [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")]
+    assert build_decision_intervals(shadowed, "deny") == build_decision_intervals(
+        [("allow", "10.0.0.0/8")], "deny"
+    )
+
+
+def test_compare_identical_and_shadowed_rules_equivalent():
+    rules = [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")]
+    # 相同规则集必然等价
+    assert compare_rule_sets(rules, "deny", rules, "deny")["equivalent"]
+    # 追加一条被完全遮蔽的规则不改变最终判定
+    with_extra = [*rules, ("allow", "10.1.0.0/24")]
+    assert compare_rule_sets(rules, "deny", with_extra, "deny") == {
+        "equivalent": True,
+        "differences": [],
+    }
+    # 空规则集 + 相同默认动作同样等价
+    assert compare_rule_sets([], "allow", [], "allow") == {
+        "equivalent": True,
+        "differences": [],
+    }
+
+
+def test_compare_order_matters_first_match_wins():
+    # 与 /analyze 一致的顺序敏感性：10.1/16 左侧 allow、右侧 deny
+    left = [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")]
+    right = [("deny", "10.1.0.0/16"), ("allow", "10.0.0.0/8")]
+    result = compare_rule_sets(left, "deny", right, "deny")
+    assert result["equivalent"] is False
+    assert result["differences"] == [
+        {
+            "left_action": "allow",
+            "right_action": "deny",
+            "address_count": 1 << 16,
+            "cidrs": ["10.1.0.0/16"],
+        }
+    ]
+
+
+def test_compare_default_action_drives_full_space():
+    # 两侧都没有规则，默认动作不同 -> 整个 IPv4 空间不同
+    result = compare_rule_sets([], "allow", [], "deny")
+    assert result == {
+        "equivalent": False,
+        "differences": [
+            {
+                "left_action": "allow",
+                "right_action": "deny",
+                "address_count": V4_SPACE,
+                "cidrs": ["0.0.0.0/0"],
+            }
+        ],
+    }
+
+    # 左 allow 0/0（default deny 不生效）与右空规则 default allow 等价
+    assert compare_rule_sets(
+        [("allow", "0.0.0.0/0")], "deny", [], "allow"
+    )["equivalent"]
+
+
+def test_compare_bidirectional_groups_and_minimal_compression():
+    left = [("allow", "10.0.0.0/8"), ("deny", "11.0.0.0/8")]
+    right = [("deny", "10.0.0.0/8"), ("allow", "11.0.0.0/8")]
+    result = compare_rule_sets(left, "deny", right, "allow")
+
+    groups = {
+        (g["left_action"], g["right_action"]): g for g in result["differences"]
+    }
+    assert set(groups) == {("allow", "deny"), ("deny", "allow")}
+    assert groups[("allow", "deny")]["cidrs"] == ["10.0.0.0/8"]
+    assert groups[("allow", "deny")]["address_count"] == 1 << 24
+    # 11/8 双向 + default 在其余空间 deny/allow，压缩必须与标准库挖洞结果一致
+    rest = groups[("deny", "allow")]
+    expected = [
+        str(c)
+        for c in collapse_addresses(
+            list(ip_network("0.0.0.0/0").address_exclude(ip_network("10.0.0.0/8")))
+        )
+    ]
+    assert rest["cidrs"] == expected
+    assert rest["address_count"] == V4_SPACE - (1 << 24)
+    assert sum(g["address_count"] for g in result["differences"]) == V4_SPACE
+
+
+def test_compare_rejects_invalid_inputs():
+    with pytest.raises(InvalidCIDRError):
+        compare_rule_sets([("allow", "10.0.0.1/8")], "deny", [], "deny")
+    with pytest.raises(InvalidCIDRError):
+        compare_rule_sets([], "deny", [("allow", "2001:db8::/32")], "deny")
+    with pytest.raises(ValueError):
+        compare_rule_sets([("permit", "10.0.0.0/8")], "deny", [], "deny")
+    with pytest.raises(ValueError):
+        compare_rule_sets([], "PERMIT", [], "deny")
+
+
+def test_compare_random_rules_oracle():
+    """与逐地址暴力 oracle 对比（差异仅可能出现在 10.0.0.0/24 内）。"""
+    rng = random.Random(20260918)
+    universe = [str(n) for n in ip_network("10.0.0.0/24").subnets(new_prefix=30)]
+    base = int(ip_network("10.0.0.0/24").network_address)
+    outside_nets = list(
+        ip_network("0.0.0.0/0").address_exclude(ip_network("10.0.0.0/24"))
+    )
+
+    def make_rules():
+        return [
+            (rng.choice(["allow", "deny"]), rng.choice(universe))
+            for _ in range(rng.randint(0, 10))
+        ]
+
+    def decide(parsed, default, value):
+        for action, (start, end, _) in parsed:
+            if start <= value <= end:
+                return action
+        return default
+
+    for _ in range(200):
+        left_raw, right_raw = make_rules(), make_rules()
+        left_default = rng.choice(["allow", "deny"])
+        right_default = rng.choice(["allow", "deny"])
+        left_parsed = [(a, parse_cidr_v4(c)) for a, c in left_raw]
+        right_parsed = [(a, parse_cidr_v4(c)) for a, c in right_raw]
+
+        result = compare_rule_sets(left_raw, left_default, right_raw, right_default)
+
+        expected: dict[tuple[str, str], set] = {}
+        for value in range(base, base + 256):
+            la = decide(left_parsed, left_default, value)
+            ra = decide(right_parsed, right_default, value)
+            if la != ra:
+                expected.setdefault((la, ra), set()).add(value)
+
+        # /24 之外只有 default 可能不同
+        external = left_default != right_default
+        got = {
+            (g["left_action"], g["right_action"]): g for g in result["differences"]
+        }
+        expected_keys = set(expected) | (
+            {(left_default, right_default)} if external else set()
+        )
+        assert set(got) == expected_keys
+
+        for key, addresses in expected.items():
+            group = got[key]
+            if external and key == (left_default, right_default):
+                # 该组同时包含 /24 外的 default 差异，稍后统一校验
+                continue
+            assert group["address_count"] == len(addresses)
+            assert group["cidrs"] == [
+                str(c)
+                for c in collapse_addresses(
+                    [ip_network(f"{IPv4Address(value)}/32") for value in addresses]
+                )
+            ]
+        if external:
+            group = got[(left_default, right_default)]
+            within = expected.get((left_default, right_default), set())
+            within_nets = [
+                ip_network(f"{IPv4Address(value)}/32") for value in within
+            ]
+            assert group["cidrs"] == [
+                str(c) for c in collapse_addresses([*within_nets, *outside_nets])
+            ]
+            assert group["address_count"] == len(within) + V4_SPACE - 256
+
+        assert result["equivalent"] == (not expected and not external)

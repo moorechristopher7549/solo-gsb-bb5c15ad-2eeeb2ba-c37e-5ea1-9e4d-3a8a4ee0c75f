@@ -1,6 +1,6 @@
 # IPv4 遮蔽分析 API
 
-基于 **Python + FastAPI** 的 IPv4 CIDR 规则遮蔽（shadowing）分析服务。
+基于 **Python + FastAPI** 的 IPv4 CIDR 规则遮蔽（shadowing）分析与等价性比较服务。
 
 按输入顺序处理一组有序的 `allow` / `deny` CIDR 规则，计算每条规则
 **未被此前任何规则覆盖**的地址集合，并分为：
@@ -13,6 +13,10 @@
 
 每条规则的生效（剩余）地址集合会**无损压缩成数量最少的 CIDR 列表**，
 并在 `summary` 中汇总生效的 `allow`、`deny` 地址数。
+
+`POST /compare` 还可比较两组规则（各带未命中时的 `default_action`）在
+**整个 IPv4 空间**上的最终判定是否等价，并按 left/right 动作分组给出
+判定不同的地址集合及其最少 CIDR 表示。
 
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
@@ -28,6 +32,7 @@ docker compose up --build -d
 
 - **API 基础地址：** http://localhost:8000
 - **分析接口：** `POST http://localhost:8000/analyze`
+- **比较接口：** `POST http://localhost:8000/compare`
 - **交互式文档（Swagger UI）：** http://localhost:8000/docs
 - **OpenAPI Schema：** http://localhost:8000/openapi.json
 - **健康检查：** http://localhost:8000/health
@@ -142,14 +147,174 @@ curl -s http://localhost:8000/analyze \
   -d '{"rules":[{"action":"allow","cidr":"0.0.0.0/0"},{"action":"deny","cidr":"8.8.8.8/32"}]}'
 ```
 
+---
+
+### `POST /compare`
+
+比较两组有序 allow/deny 规则在**整个 IPv4 空间**（`0.0.0.0/0`）上的最终
+判定是否等价。两侧各自独立，均沿用 `/analyze` 的 CIDR 校验与
+**首条匹配规则生效**的顺序语义；未命中任何规则的地址取该侧的
+`default_action`。
+
+#### 请求体
+
+```json
+{
+  "left": {
+    "rules": [
+      {"action": "allow", "cidr": "10.0.0.0/8"},
+      {"action": "deny",  "cidr": "10.1.0.0/16"}
+    ],
+    "default_action": "deny"
+  },
+  "right": {
+    "rules": [
+      {"action": "deny",  "cidr": "10.1.0.0/16"},
+      {"action": "allow", "cidr": "10.0.0.0/8"}
+    ],
+    "default_action": "deny"
+  }
+}
+```
+
+- `left` / `right`：两侧规则集，结构相同。
+  - `rules`：**有序**规则列表（按数组顺序逐条处理），**允许为空** `[]`；
+    为空时该侧所有地址都走默认动作。
+  - `default_action`：**必填**，未命中任何规则时的最终动作，仅允许
+    `allow` / `deny`（大小写不敏感，会规范化为小写）。
+- `rules` 内每条规则的 `action` / `cidr` 校验规则与 `/analyze` 完全一致
+  （严格 IPv4 CIDR、纯 IP 按 `/32`、主机位必须为零、禁止 IPv6）。
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `equivalent` | 两侧在整个 IPv4 空间上的最终判定是否完全一致；为 `true` 时 `differences` 为空 |
+| `differences[]` | 判定不同的地址分组，按 `left_action`、`right_action` 组合聚合，最多 2 组 |
+| `differences[].left_action` / `.right_action` | 该组地址在左侧 / 右侧的最终动作 |
+| `differences[].address_count` | 该组覆盖的地址数（各组之和 ≤ 2³²） |
+| `differences[].cidrs` | 该组地址集合**无损压缩后的最少 CIDR 列表** |
+
+分组按 `(left_action, right_action)` 字典序返回：
+`(allow, deny)` 在前，`(deny, allow)` 在后。整个比较基于整数区间归并
+计算，**不会逐地址枚举 IPv4 空间**。
+
+#### 响应示例（200，不等价）
+
+上例中 `10.1.0.0/16` 左侧先命中 `allow 10.0.0.0/8`，右侧先命中
+`deny 10.1.0.0/16`，因此仅这一个 `/16` 的判定不同：
+
+```json
+{
+  "equivalent": false,
+  "differences": [
+    {
+      "left_action": "allow",
+      "right_action": "deny",
+      "address_count": 65536,
+      "cidrs": ["10.1.0.0/16"]
+    }
+  ]
+}
+```
+
+#### 响应示例（200，完全等价）
+
+被此前规则**完全遮蔽**的规则不影响最终判定；`default_action` 大小写不敏感：
+
+请求：
+
+```json
+{
+  "left": {
+    "rules": [{"action": "allow", "cidr": "10.0.0.0/8"}],
+    "default_action": "deny"
+  },
+  "right": {
+    "rules": [
+      {"action": "allow", "cidr": "10.0.0.0/8"},
+      {"action": "deny",  "cidr": "10.1.0.0/16"}
+    ],
+    "default_action": "DENY"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "equivalent": true,
+  "differences": []
+}
+```
+
+#### 默认动作导致的全空间差异
+
+左侧仅放行 `10.0.0.0/8`、其余默认 `deny`；右侧无规则、默认 `allow`。
+除 `10.0.0.0/8` 外的全部地址构成一个 `deny → allow` 组，被压缩为
+8 个 CIDR（地址计数 4294967296 − 16777216 = 4278190080）：
+
+请求：
+
+```json
+{
+  "left": {
+    "rules": [{"action": "allow", "cidr": "10.0.0.0/8"}],
+    "default_action": "deny"
+  },
+  "right": {
+    "rules": [],
+    "default_action": "allow"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "equivalent": false,
+  "differences": [
+    {
+      "left_action": "deny",
+      "right_action": "allow",
+      "address_count": 4278190080,
+      "cidrs": [
+        "0.0.0.0/5",
+        "8.0.0.0/7",
+        "11.0.0.0/8",
+        "12.0.0.0/6",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1"
+      ]
+    }
+  ]
+}
+```
+
+#### curl 示例
+
+```bash
+curl -s http://localhost:8000/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "left":  {"rules":[{"action":"allow","cidr":"10.0.0.0/8"}], "default_action":"deny"},
+    "right": {"rules": [],                                        "default_action":"allow"}
+  }'
+```
+
 ### 错误响应（422 Unprocessable Entity）
 
 以下输入均返回 HTTP `422`，错误明细位于 `detail`：
 
-- 空规则集：`{"rules": []}` 或缺少 `rules`
+- 空规则集（仅 `/analyze`）：`{"rules": []}` 或缺少 `rules`
+- `/compare` 缺少 `left` / `right`，或任一侧缺少 `default_action`
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
-- 非法 / 缺失 `action`、字段类型错误、JSON 格式错误
+- 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
 
 ---
 
@@ -169,8 +334,10 @@ pytest -q
 ```
 
 测试覆盖：解析校验（含 IPv6 拒绝）、区间差集与合并、最少 CIDR 压缩、
-三种遮蔽分类、跨动作遮蔽、顺序敏感性，以及用标准库
-`ipaddress.collapse_addresses` 作为 oracle 的随机属性测试（无损 + 最少块）。
+三种遮蔽分类、跨动作遮蔽、顺序敏感性，`/compare` 的等价判定、顺序/默认
+动作差异、双向分组与全空间压缩，以及用标准库
+`ipaddress.collapse_addresses` 作为 oracle 的随机属性测试（无损 + 最少块，
+并与逐地址暴力判定对比）。
 
 ---
 
@@ -180,8 +347,8 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析
-│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze 接口
+│   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析与等价比较
+│   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare 接口
 ├── tests/
 │   ├── test_analyzer.py
 │   └── test_api.py
@@ -198,5 +365,10 @@ pytest -q
   （allow ∪ deny）覆盖地址的并集；规则区间减去遮蔽集合即生效集合。
 - **无损压缩**：剩余碎片先合并相邻区间，再以“当前地址能对齐的最大
   2 的幂块、且不越过区间末端”贪心切块，得到最少数量的 CIDR。
+- **等价比较**：先为每侧构造覆盖整个 IPv4 空间的有序判定分区
+  （规则生效碎片 + 未命中地址的 default_action），再以双指针归并两个
+  分区，交叠处动作不同即记入对应 `(left_action, right_action)` 分组；
+  分组碎片同样走“合并 + 贪心切块”。时间复杂度仅取决于区间数量，
+  **不逐地址枚举**，可安全处理 `0.0.0.0/0` 全空间。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

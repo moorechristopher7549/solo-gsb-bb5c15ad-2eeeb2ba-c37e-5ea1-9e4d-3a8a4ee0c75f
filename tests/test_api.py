@@ -10,6 +10,10 @@ def post_analyze(rules):
     return client.post("/analyze", json={"rules": rules})
 
 
+def post_compare(left, right):
+    return client.post("/compare", json={"left": left, "right": right})
+
+
 def test_root_and_health():
     assert client.get("/").status_code == 200
     assert client.get("/health").json() == {"status": "ok"}
@@ -99,3 +103,126 @@ def test_malformed_json_422():
 def test_openapi_docs_available():
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
+
+
+# ---------- /compare ----------
+
+def test_compare_equivalent_empty_sets():
+    resp = post_compare(
+        {"rules": [], "default_action": "allow"},
+        {"rules": [], "default_action": "ALLOW"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"equivalent": True, "differences": []}
+
+
+def test_compare_default_only_full_space_diff():
+    resp = post_compare(
+        {"rules": [], "default_action": "deny"},
+        {"rules": [], "default_action": "allow"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["equivalent"] is False
+    assert body["differences"] == [
+        {
+            "left_action": "deny",
+            "right_action": "allow",
+            "address_count": 1 << 32,
+            "cidrs": ["0.0.0.0/0"],
+        }
+    ]
+
+
+def test_compare_rules_only_one_side():
+    resp = post_compare(
+        {"rules": [{"action": "allow", "cidr": "10.0.0.0/8"}],
+         "default_action": "deny"},
+        {"rules": [], "default_action": "deny"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["differences"] == [
+        {
+            "left_action": "allow",
+            "right_action": "deny",
+            "address_count": 1 << 24,
+            "cidrs": ["10.0.0.0/8"],
+        }
+    ]
+
+
+def test_compare_order_sensitivity_and_bidirectional_groups():
+    resp = post_compare(
+        {
+            "rules": [
+                {"action": "allow", "cidr": "10.0.0.0/8"},
+                {"action": "deny", "cidr": "10.1.0.0/16"},
+            ],
+            "default_action": "deny",
+        },
+        {
+            "rules": [
+                {"action": "deny", "cidr": "10.1.0.0/16"},
+                {"action": "allow", "cidr": "10.0.0.0/8"},
+            ],
+            "default_action": "deny",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["differences"] == [
+        {
+            "left_action": "allow",
+            "right_action": "deny",
+            "address_count": 1 << 16,
+            "cidrs": ["10.1.0.0/16"],
+        }
+    ]
+
+
+def test_compare_shadowed_rule_still_equivalent():
+    resp = post_compare(
+        {
+            "rules": [{"action": "allow", "cidr": "10.0.0.0/8"}],
+            "default_action": "deny",
+        },
+        {
+            "rules": [
+                {"action": "allow", "cidr": "10.0.0.0/8"},
+                {"action": "deny", "cidr": "10.0.0.1/32"},
+            ],
+            "default_action": "Deny",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"equivalent": True, "differences": []}
+
+
+def test_compare_validation_422():
+    base = {"rules": [], "default_action": "deny"}
+
+    # 缺少 default_action
+    resp = client.post("/compare", json={"left": {"rules": []}, "right": base})
+    assert resp.status_code == 422
+
+    # 非法 default_action / action
+    assert post_compare(
+        {"rules": [], "default_action": "permit"}, base
+    ).status_code == 422
+    assert post_compare(
+        {"rules": [{"action": "permit", "cidr": "10.0.0.0/8"}],
+         "default_action": "deny"},
+        base,
+    ).status_code == 422
+
+    # 非法 CIDR / IPv6（沿用 /analyze 校验）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "2001:db8::/32", "garbage"]:
+        resp = post_compare(
+            {"rules": [{"action": "allow", "cidr": bad}],
+             "default_action": "deny"},
+            base,
+        )
+        assert resp.status_code == 422, bad
+
+    # 缺少一侧 / 请求体为空
+    assert client.post("/compare", json={"left": base}).status_code == 422
+    assert client.post("/compare", json={}).status_code == 422
