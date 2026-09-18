@@ -2,12 +2,14 @@
 import random
 
 import pytest
-from ipaddress import IPv4Network, collapse_addresses, ip_network
+from ipaddress import IPv4Address, IPv4Network, collapse_addresses, ip_network, summarize_address_range
 
 from app.analyzer import (
     InvalidCIDRError,
     analyze_rules,
+    compare_rule_sets,
     compress_intervals,
+    decision_partition,
     merge_intervals,
     parse_cidr_v4,
     range_to_cidrs,
@@ -212,4 +214,174 @@ def test_random_rules_oracle():
         assert (
             sum(r["effective_addresses"] for r in result["rules"])
             == len(seen_effective)
+        )
+
+
+# ---------- 判定分区与规则集比较 ----------
+
+def test_decision_partition_covers_full_space():
+    segments = decision_partition(
+        [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")], "deny"
+    )
+    # 有序、互不相交、无缝覆盖整个 IPv4 空间
+    assert segments[0][0] == 0
+    assert segments[-1][1] == (1 << 32) - 1
+    for (_, prev_end, _), (next_start, _, _) in zip(segments, segments[1:]):
+        assert next_start == prev_end + 1
+    # 首条匹配生效：10.1.0.0/16 落在 allow 10.0.0.0/8 内，deny 被遮蔽
+    actions = {
+        (start, end): action for start, end, action in segments
+    }
+    assert actions[(10 << 24, (10 << 24) + (1 << 24) - 1)] == "allow"
+    assert actions[(0, (10 << 24) - 1)] == "deny"
+
+
+def test_decision_partition_empty_rules_all_default():
+    assert decision_partition([], "allow") == [(0, (1 << 32) - 1, "allow")]
+
+
+def test_compare_equivalent_despite_rule_order():
+    # 左侧 deny 10.1.0.0/16 被 allow 10.0.0.0/8 遮蔽 -> 与右侧单条 allow 等价
+    result = compare_rule_sets(
+        [("allow", "10.0.0.0/8"), ("deny", "10.1.0.0/16")],
+        "deny",
+        [("allow", "10.0.0.0/8")],
+        "deny",
+    )
+    assert result == {"equivalent": True, "differing_addresses": 0, "differences": []}
+
+    # deny 0.0.0.0/0 使后续规则与默认动作全部失效 -> 与纯默认 deny 等价
+    result2 = compare_rule_sets(
+        [("deny", "0.0.0.0/0"), ("allow", "10.0.0.0/8")], "allow", [], "deny"
+    )
+    assert result2["equivalent"] is True
+    assert result2["differences"] == []
+
+
+def test_compare_groups_both_directions():
+    result = compare_rule_sets(
+        [("allow", "10.0.0.0/8"), ("deny", "11.0.0.0/8")],
+        "deny",
+        [("deny", "10.0.0.0/8"), ("allow", "11.0.0.0/8")],
+        "deny",
+    )
+    assert result["equivalent"] is False
+    assert result["differing_addresses"] == 2 * (1 << 24)
+    assert result["differences"] == [
+        {
+            "left_action": "allow",
+            "right_action": "deny",
+            "address_count": 1 << 24,
+            "cidrs": ["10.0.0.0/8"],
+        },
+        {
+            "left_action": "deny",
+            "right_action": "allow",
+            "address_count": 1 << 24,
+            "cidrs": ["11.0.0.0/8"],
+        },
+    ]
+
+
+def test_compare_default_action_decides_unmatched():
+    # 两侧均无规则：整个空间的判定由默认动作决定
+    result = compare_rule_sets([], "allow", [], "deny")
+    assert result["differences"] == [
+        {
+            "left_action": "allow",
+            "right_action": "deny",
+            "address_count": 1 << 32,
+            "cidrs": ["0.0.0.0/0"],
+        }
+    ]
+    assert result["differing_addresses"] == 1 << 32
+    # 动作大小写不敏感
+    assert compare_rule_sets([], "ALLOW", [], "Allow")["equivalent"] is True
+
+
+def test_compare_rejects_invalid_input():
+    with pytest.raises(InvalidCIDRError):
+        compare_rule_sets([("allow", "2001:db8::/32")], "deny", [], "deny")
+    with pytest.raises(InvalidCIDRError):
+        compare_rule_sets([], "deny", [("allow", "10.0.0.1/8")], "deny")
+    with pytest.raises(ValueError):
+        compare_rule_sets([("permit", "10.0.0.0/8")], "deny", [], "deny")
+    with pytest.raises(ValueError):
+        compare_rule_sets([], "permit", [], "deny")
+
+
+def test_compare_random_oracle():
+    """随机规则集：与逐地址 oracle（限 10.0.0.0/20 内）+ 标准库压缩对照。"""
+    rng = random.Random(20260918)
+    universe = list(ip_network("10.0.0.0/20").subnets(new_prefix=24))  # 16 个 /24
+    lo = int(IPv4Address("10.0.0.0"))
+    hi = lo + (1 << 12) - 1
+
+    def decide(rules, default, ip):
+        for action, net in rules:
+            if ip in net:
+                return action
+        return default
+
+    for _ in range(20):
+        def rand_side():
+            picked = rng.sample(universe, k=rng.randint(0, 6))
+            rules = [(rng.choice(["allow", "deny"]), str(net)) for net in picked]
+            return rules, rng.choice(["allow", "deny"])
+
+        left_rules, left_default = rand_side()
+        right_rules, right_default = rand_side()
+        left_nets = [(a, ip_network(c)) for a, c in left_rules]
+        right_nets = [(a, ip_network(c)) for a, c in right_rules]
+
+        result = compare_rule_sets(
+            left_rules, left_default, right_rules, right_default
+        )
+
+        # 逐地址求期望的差异区间（仅 10.0.0.0/20 内可能因规则不同）
+        expected_intervals: dict = {}
+        run_key = None
+        run_start = lo
+        for ip_int in range(lo, hi + 1):
+            ip = IPv4Address(ip_int)
+            la = decide(left_nets, left_default, ip)
+            ra = decide(right_nets, right_default, ip)
+            key = (la, ra) if la != ra else None
+            if key != run_key:
+                if run_key is not None:
+                    expected_intervals.setdefault(run_key, []).append(
+                        (run_start, ip_int - 1)
+                    )
+                run_key = key
+                run_start = ip_int
+        if run_key is not None:
+            expected_intervals.setdefault(run_key, []).append((run_start, hi))
+        # 10.0.0.0/20 之外两侧都只能落到各自的默认动作
+        if left_default != right_default:
+            outside = expected_intervals.setdefault((left_default, right_default), [])
+            outside.extend([(0, lo - 1), (hi + 1, (1 << 32) - 1)])
+
+        # 用标准库把期望区间压缩为最少 CIDR，作为无损 + 最少的对照
+        expected_groups = {}
+        for key, intervals in expected_intervals.items():
+            cidrs = []
+            count = 0
+            for start, end in merge_intervals(intervals):
+                count += end - start + 1
+                cidrs.extend(
+                    str(net)
+                    for net in summarize_address_range(
+                        IPv4Address(start), IPv4Address(end)
+                    )
+                )
+            expected_groups[key] = (count, cidrs)
+
+        assert result["equivalent"] == (not expected_groups)
+        got = {(d["left_action"], d["right_action"]): d for d in result["differences"]}
+        assert set(got) == set(expected_groups)
+        for key, (count, cidrs) in expected_groups.items():
+            assert got[key]["address_count"] == count
+            assert got[key]["cidrs"] == cidrs
+        assert result["differing_addresses"] == sum(
+            count for count, _ in expected_groups.values()
         )

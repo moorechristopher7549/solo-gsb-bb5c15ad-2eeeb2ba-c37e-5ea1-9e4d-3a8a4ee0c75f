@@ -8,6 +8,10 @@ IPv4 CIDR 列表，并按覆盖比例分类：
 - full      全生效：规则地址均未被此前规则覆盖
 - partial   部分遮蔽：部分地址此前已被覆盖
 - shadowed  完全遮蔽：全部地址此前已被覆盖
+
+此外提供规则集比较：把每侧「有序规则 + 未命中默认动作」展开为覆盖
+整个 IPv4 空间的判定分区（首条匹配规则生效），再对两个分区做区间
+扫描，求出两侧最终判定不同的地址集合（按动作组合分组）。
 """
 from __future__ import annotations
 
@@ -21,6 +25,10 @@ FULL = "full"
 PARTIAL = "partial"
 SHADOWED = "shadowed"
 
+ALLOW = "allow"
+DENY = "deny"
+ACTIONS = (ALLOW, DENY)
+
 STATUS_LABELS = {
     FULL: "全生效",
     PARTIAL: "部分遮蔽",
@@ -30,6 +38,15 @@ STATUS_LABELS = {
 
 class InvalidCIDRError(ValueError):
     """非法 CIDR（格式错误、主机位非零、IPv6 等）。"""
+
+
+def normalize_action(action: str) -> str:
+    """规范化动作（大小写不敏感）；非法动作抛出 :class:`ValueError`。"""
+    if isinstance(action, str):
+        normalized = action.strip().lower()
+        if normalized in ACTIONS:
+            return normalized
+    raise ValueError(f"非法 action: {action!r}")
 
 
 def parse_cidr_v4(text: str) -> tuple[int, int, str]:
@@ -141,9 +158,7 @@ def analyze_rules(
     status_counts = {FULL: 0, PARTIAL: 0, SHADOWED: 0}
 
     for index, (action, raw_cidr) in enumerate(rules):
-        action = action.strip().lower()
-        if action not in ("allow", "deny"):
-            raise ValueError(f"非法 action: {action!r}")
+        action = normalize_action(action)
 
         start, end, cidr = parse_cidr_v4(raw_cidr)
         total_addresses = end - start + 1
@@ -191,4 +206,91 @@ def analyze_rules(
             "effective_allow_addresses": effective_totals["allow"],
             "effective_deny_addresses": effective_totals["deny"],
         },
+    }
+
+
+def decision_partition(
+    rules: Sequence[tuple[str, str]], default_action: str
+) -> list[tuple[int, int, str]]:
+    """把「有序规则 + 默认动作」展开为覆盖整个 IPv4 空间的判定分区。
+
+    返回 ``[(start, end, action), ...]``：按起点升序、互不相交，且并集
+    恰好为 ``[0, 2^32 - 1]``。语义与 :func:`analyze_rules` 一致——首条
+    匹配规则生效；未命中任何规则的地址归 ``default_action``。
+    """
+    default = normalize_action(default_action)
+
+    covered: list[tuple[int, int]] = []
+    segments: list[tuple[int, int, str]] = []
+    for action, raw_cidr in rules:
+        action = normalize_action(action)
+        start, end, _ = parse_cidr_v4(raw_cidr)
+        # 与 analyze 相同：只有未被此前规则覆盖的部分才生效
+        for frag_start, frag_end in subtract_covered((start, end), covered):
+            segments.append((frag_start, frag_end, action))
+        covered = merge_intervals([*covered, (start, end)])
+
+    # 未命中区域 = 已覆盖区间的补集，归默认动作
+    cursor = 0
+    for cov_start, cov_end in covered:
+        if cov_start > cursor:
+            segments.append((cursor, cov_start - 1, default))
+        cursor = cov_end + 1
+    if cursor <= V4_SPACE - 1:
+        segments.append((cursor, V4_SPACE - 1, default))
+
+    segments.sort(key=lambda seg: seg[0])
+    return segments
+
+
+def compare_rule_sets(
+    left_rules: Sequence[tuple[str, str]],
+    left_default_action: str,
+    right_rules: Sequence[tuple[str, str]],
+    right_default_action: str,
+) -> dict:
+    """比较两组「有序规则 + 默认动作」在整个 IPv4 空间上的最终判定。
+
+    返回可直接 JSON 序列化的字典：``differences`` 按
+    ``(left_action, right_action)`` 分组，每组给出地址数与无损压缩的
+    最少 CIDR 列表；完全等价时 ``equivalent`` 为 True 且分组为空。
+    全程为区间扫描，复杂度与规则数成正比，不逐地址枚举。
+    """
+    left = decision_partition(left_rules, left_default_action)
+    right = decision_partition(right_rules, right_default_action)
+
+    # 双指针扫描两个分区（均有序、互不相交、覆盖全空间），收集判定不同的交集段
+    grouped: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    i = j = 0
+    while i < len(left) and j < len(right):
+        l_start, l_end, l_action = left[i]
+        r_start, r_end, r_action = right[j]
+        if l_action != r_action:
+            start = max(l_start, r_start)
+            end = min(l_end, r_end)
+            grouped.setdefault((l_action, r_action), []).append((start, end))
+        if l_end < r_end:
+            i += 1
+        elif r_end < l_end:
+            j += 1
+        else:
+            i += 1
+            j += 1
+
+    differences = []
+    for l_action, r_action in sorted(grouped):
+        intervals = grouped[(l_action, r_action)]
+        differences.append(
+            {
+                "left_action": l_action,
+                "right_action": r_action,
+                "address_count": sum(end - start + 1 for start, end in intervals),
+                "cidrs": compress_intervals(intervals),
+            }
+        )
+
+    return {
+        "equivalent": not differences,
+        "differing_addresses": sum(d["address_count"] for d in differences),
+        "differences": differences,
     }

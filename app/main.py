@@ -1,4 +1,4 @@
-"""FastAPI 应用：IPv4 CIDR 遮蔽分析 API。"""
+"""FastAPI 应用：IPv4 CIDR 遮蔽分析 / 规则集比较 API。"""
 from __future__ import annotations
 
 from typing import Literal
@@ -6,7 +6,12 @@ from typing import Literal
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
 
-from .analyzer import InvalidCIDRError, analyze_rules, parse_cidr_v4
+from .analyzer import (
+    InvalidCIDRError,
+    analyze_rules,
+    compare_rule_sets,
+    parse_cidr_v4,
+)
 
 app = FastAPI(
     title="IPv4 遮蔽分析 API",
@@ -14,8 +19,10 @@ app = FastAPI(
         "接收有序的 allow/deny CIDR 规则，计算每条规则未被此前规则覆盖的"
         "地址集合，按 **全生效 (full)** / **部分遮蔽 (partial)** / "
         "**完全遮蔽 (shadowed)** 分类，并将剩余集合无损压缩为数量最少的 CIDR。"
+        "另提供 **/compare**：比较两组「有序规则 + 默认动作」在整个 IPv4 "
+        "空间上的最终判定是否等价，并给出判定不同的地址集合。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -78,6 +85,50 @@ class AnalyzeResponse(BaseModel):
     summary: Summary
 
 
+class RuleSide(BaseModel):
+    """比较的一侧：有序规则列表 + 未命中时的默认动作。"""
+
+    rules: list[Rule] = Field(
+        ..., description="有序规则列表（按序处理；可为空，表示全部走默认动作）"
+    )
+    default_action: Literal["allow", "deny"] = Field(
+        ..., description="未命中任何规则时的默认动作（大小写不敏感）"
+    )
+
+    @field_validator("default_action", mode="before")
+    @classmethod
+    def normalize_default_action(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class CompareRequest(BaseModel):
+    """比较请求：左、右两侧规则集。"""
+
+    left: RuleSide = Field(..., description="左侧规则集")
+    right: RuleSide = Field(..., description="右侧规则集")
+
+
+class DifferenceGroup(BaseModel):
+    left_action: Literal["allow", "deny"]
+    right_action: Literal["allow", "deny"]
+    address_count: int = Field(..., description="该分组内判定不同的地址数")
+    cidrs: list[str] = Field(
+        ..., description="该分组地址集合无损压缩后的最少 CIDR 列表"
+    )
+
+
+class CompareResponse(BaseModel):
+    equivalent: bool = Field(
+        ..., description="两组规则在整个 IPv4 空间上的最终判定是否完全等价"
+    )
+    differing_addresses: int = Field(..., description="判定不同的地址总数")
+    differences: list[DifferenceGroup] = Field(
+        ..., description="按 (left_action, right_action) 分组的差异；等价时为空"
+    )
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -112,3 +163,25 @@ def analyze(request: AnalyzeRequest) -> dict:
     except InvalidCIDRError:
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
         raise
+
+
+@app.post(
+    "/compare",
+    response_model=CompareResponse,
+    tags=["compare"],
+    summary="比较两组有序规则 + 默认动作的最终判定是否等价",
+)
+def compare(request: CompareRequest) -> dict:
+    """对整个 IPv4 空间计算两侧判定不同的地址集合。
+
+    两侧均沿用 /analyze 的 CIDR 校验与“首条匹配规则生效”顺序语义；
+    未命中任何规则的地址按各自的 ``default_action`` 判定。差异按
+    ``(left_action, right_action)`` 分组，每组给出地址数与无损压缩的
+    最少 CIDR 列表。非法 CIDR、IPv6、非法动作均返回 **422**。
+    """
+    return compare_rule_sets(
+        [(r.action, r.cidr) for r in request.left.rules],
+        request.left.default_action,
+        [(r.action, r.cidr) for r in request.right.rules],
+        request.right.default_action,
+    )
